@@ -67,6 +67,18 @@ export interface SelfResolvingConfig {
   minVotes: number;
 }
 
+/**
+ * Clamp self-resolving knobs to operational bounds.
+ * Malformed env / config must not pause settlement or force an infinite jury.
+ */
+export function normalizeSelfResolvingConfig(cfg: SelfResolvingConfig): SelfResolvingConfig {
+  const rawAlpha = Number(cfg.alpha);
+  const rawMin = Number(cfg.minVotes);
+  const alpha = Number.isFinite(rawAlpha) ? Math.min(1, Math.max(0, rawAlpha)) : 0.25;
+  const minVotes = Number.isFinite(rawMin) ? Math.max(1, Math.trunc(rawMin)) : 1;
+  return { alpha, minVotes };
+}
+
 // ── Self-resolving mechanism math (pure, unit-tested) ─────────────────────────
 
 /** Common prior. The on-chain pool ratio would be the natural prior but is
@@ -102,9 +114,17 @@ export function verdictToProbability(verdict: Verdict, confidence: number, qPrev
  * contribution, judged by the terminal reference belief qT.
  *   S = qT·ln(qt/qPrev) + (1−qT)·ln((1−qt)/(1−qPrev))
  * Zero when qt === qPrev (no update); positive for updates toward qT.
+ *
+ * Inputs are clamped into (Q_MIN, Q_MAX). Malformed / non-finite values
+ * collapse to the prior clamp rather than minting Inf/NaN bonuses that
+ * would corrupt USDC allocation after a funded settlement.
  */
 export function crossEntropyScore(qT: number, qt: number, qPrev: number): number {
-  return qT * Math.log(qt / qPrev) + (1 - qT) * Math.log((1 - qt) / (1 - qPrev));
+  const ref = clampQ(Number.isFinite(qT) ? qT : Q_PRIOR);
+  const q = clampQ(Number.isFinite(qt) ? qt : Q_PRIOR);
+  const prev = clampQ(Number.isFinite(qPrev) ? qPrev : Q_PRIOR);
+  if (q === prev) return 0;
+  return ref * Math.log(q / prev) + (1 - ref) * Math.log((1 - q) / (1 - prev));
 }
 
 /**
@@ -129,9 +149,12 @@ export function scoreCouncilVotes(votes: CouncilVote[], referenceQ: number): Cou
  * kept, never redistributed) and never exceeds the pool.
  */
 export function allocateBonus(scores: number[], poolUsdc: number): number[] {
-  const positives = scores.map((s) => (s > 0 ? s : 0));
+  // Non-finite pool or scores are treated as zero — a NaN bonus must never
+  // reach transferUsdc after on-chain settlement.
+  if (!Number.isFinite(poolUsdc) || poolUsdc <= 0) return scores.map(() => 0);
+  const positives = scores.map((s) => (Number.isFinite(s) && s > 0 ? s : 0));
   const total = positives.reduce((a, b) => a + b, 0);
-  if (total <= 0 || poolUsdc <= 0) return scores.map(() => 0);
+  if (total <= 0) return scores.map(() => 0);
   // Integer micro-USDC with a float-noise epsilon: floors guarantee the sum
   // never exceeds the pool.
   const poolMicro = Math.round(poolUsdc * 1e6);
@@ -182,7 +205,7 @@ export async function gatherCouncilVerdict(args: {
 }): Promise<CouncilVerdict | null> {
   const capUnits = usdcToUnits(args.capUsdc ?? 0.005);
   const quorum = args.quorum ?? 3;
-  const sr = args.selfResolving;
+  const sr = args.selfResolving ? normalizeSelfResolvingConfig(args.selfResolving) : undefined;
   // Random order prevents the same persona from always reporting first
   // (uninformed) or last (most informed) — part of the mechanism's
   // resistance to juror position gaming.
